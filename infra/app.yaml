@@ -1,0 +1,523 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Container service (Tudovu). ECS Fargate behind an internet-facing
+  Application Load Balancer (HTTP). Image from ECR. No custom domain — served on
+  the ALB DNS name. Add a domain via the Website path for HTTPS + Route53.
+
+# ── Variables your app reads that Tudovu could not supply ──────────────────────
+# CACHE_URL, CELERY_BROKER_URL, EMAIL_URL, DEFAULT_FROM_EMAIL, ALLOWED_CLIENT_HOSTS, DASHBOARD_URL, ALLOWED_HOSTS, INTERNAL_IPS, SOFT_MEMORY_LIMIT_IN_MB, HARD_MEMORY_LIMIT_IN_MB, STATIC_URL, HTTP_IP_FILTER_ALLOW_LOOPBACK_IPS, SENTRY_DSN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_STORAGE_BUCKET_NAME, GS_BUCKET_NAME, GOOGLE_CLOUD_PROJECT, OPENTELEMETRY_ENDPOINT
+#
+# These are intentionally NOT set on the container. Setting them to an empty string
+# would be worse than leaving them alone: code like os.environ.setdefault(...) or
+# process.env.X ?? default treats an empty value as "already configured" and skips
+# its own default.
+#
+# Plain values: set the matching Env* parameter below.
+# Credentials and connection strings: create a Secrets Manager secret and add it to
+# the task definition's Secrets list — Tudovu will not invent a value, because a
+# random string cannot authenticate to a third party or parse as a connection URL.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to run the service + load balancer in.
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more public subnets for the ALB and Fargate tasks.
+  ImageUri:
+    Type: String
+    Description: ECR image URI the CI/CD workflow pushes.
+  DesiredCount:
+    Type: Number
+    Default: 2
+  EnvCacheUrl:
+    Type: String
+    Default: ""
+    Description: Optional CACHE_URL for the app container. Injected only when non-empty.
+  EnvCeleryBrokerUrl:
+    Type: String
+    Default: ""
+    Description: Optional CELERY_BROKER_URL for the app container. Injected only when non-empty.
+  EnvEmailUrl:
+    Type: String
+    Default: ""
+    Description: Optional EMAIL_URL for the app container. Injected only when non-empty.
+  EnvDefaultFromEmail:
+    Type: String
+    Default: ""
+    Description: Optional DEFAULT_FROM_EMAIL for the app container. Injected only when non-empty.
+  EnvAllowedClientHosts:
+    Type: String
+    Default: ""
+    Description: Optional ALLOWED_CLIENT_HOSTS for the app container. Injected only when non-empty.
+  EnvDashboardUrl:
+    Type: String
+    Default: ""
+    Description: Optional DASHBOARD_URL for the app container. Injected only when non-empty.
+  EnvAllowedHosts:
+    Type: String
+    Default: ""
+    Description: Optional ALLOWED_HOSTS for the app container. Injected only when non-empty.
+  EnvInternalIps:
+    Type: String
+    Default: ""
+    Description: Optional INTERNAL_IPS for the app container. Injected only when non-empty.
+  EnvSoftMemoryLimitInMb:
+    Type: String
+    Default: ""
+    Description: Optional SOFT_MEMORY_LIMIT_IN_MB for the app container. Injected only when non-empty.
+  EnvHardMemoryLimitInMb:
+    Type: String
+    Default: ""
+    Description: Optional HARD_MEMORY_LIMIT_IN_MB for the app container. Injected only when non-empty.
+  EnvStaticUrl:
+    Type: String
+    Default: ""
+    Description: Optional STATIC_URL for the app container. Injected only when non-empty.
+  EnvHttpIpFilterAllowLoopbackIps:
+    Type: String
+    Default: ""
+    Description: Optional HTTP_IP_FILTER_ALLOW_LOOPBACK_IPS for the app container. Injected only when non-empty.
+  EnvAwsStorageBucketName:
+    Type: String
+    Default: ""
+    Description: Optional AWS_STORAGE_BUCKET_NAME for the app container. Injected only when non-empty.
+  EnvGsBucketName:
+    Type: String
+    Default: ""
+    Description: Optional GS_BUCKET_NAME for the app container. Injected only when non-empty.
+  EnvGoogleCloudProject:
+    Type: String
+    Default: ""
+    Description: Optional GOOGLE_CLOUD_PROJECT for the app container. Injected only when non-empty.
+  EnvOpentelemetryEndpoint:
+    Type: String
+    Default: ""
+    Description: Optional OPENTELEMETRY_ENDPOINT for the app container. Injected only when non-empty.
+  EnableDeletionProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Block accidental deletion of the database. Off by default so a stack can be torn down
+      cleanly; turn it on for anything holding data you cannot lose.
+
+Conditions:
+  HasEnvCacheUrl: !Not [!Equals [!Ref EnvCacheUrl, ""]]
+  HasEnvCeleryBrokerUrl: !Not [!Equals [!Ref EnvCeleryBrokerUrl, ""]]
+  HasEnvEmailUrl: !Not [!Equals [!Ref EnvEmailUrl, ""]]
+  HasEnvDefaultFromEmail: !Not [!Equals [!Ref EnvDefaultFromEmail, ""]]
+  HasEnvAllowedClientHosts: !Not [!Equals [!Ref EnvAllowedClientHosts, ""]]
+  HasEnvDashboardUrl: !Not [!Equals [!Ref EnvDashboardUrl, ""]]
+  HasEnvAllowedHosts: !Not [!Equals [!Ref EnvAllowedHosts, ""]]
+  HasEnvInternalIps: !Not [!Equals [!Ref EnvInternalIps, ""]]
+  HasEnvSoftMemoryLimitInMb: !Not [!Equals [!Ref EnvSoftMemoryLimitInMb, ""]]
+  HasEnvHardMemoryLimitInMb: !Not [!Equals [!Ref EnvHardMemoryLimitInMb, ""]]
+  HasEnvStaticUrl: !Not [!Equals [!Ref EnvStaticUrl, ""]]
+  HasEnvHttpIpFilterAllowLoopbackIps: !Not [!Equals [!Ref EnvHttpIpFilterAllowLoopbackIps, ""]]
+  HasEnvAwsStorageBucketName: !Not [!Equals [!Ref EnvAwsStorageBucketName, ""]]
+  HasEnvGsBucketName: !Not [!Equals [!Ref EnvGsBucketName, ""]]
+  HasEnvGoogleCloudProject: !Not [!Equals [!Ref EnvGoogleCloudProject, ""]]
+  HasEnvOpentelemetryEndpoint: !Not [!Equals [!Ref EnvOpentelemetryEndpoint, ""]]
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB ingress (HTTP 80) from the internet.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tasks accept traffic only from the ALB.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-399
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/tudovu/${AWS::StackName}"
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/TudovuArchitectBoundary'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DbSecret
+                  - !Ref DbUrlSecret
+                  - !Ref SecretSecretKey
+
+  SecretSecretKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "SECRET_KEY for ${AWS::StackName}"
+      GenerateSecretString:
+        PasswordLength: 50
+        ExcludePunctuation: true
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/TudovuArchitectBoundary'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: app-bucket-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt AppBucket.Arn
+                  - !Sub "${AppBucket.Arn}/*"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !Ref TaskExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          PortMappings:
+            - ContainerPort: 8000
+          Essential: true
+          Environment:
+            - Name: POSTGRES_HOST
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: POSTGRES_PORT
+              Value: !GetAtt Database.Endpoint.Port
+            - Name: POSTGRES_DB
+              Value: "appdb"
+            - Name: POSTGRES_USER
+              Value: "appuser"
+            - Name: DB_HOST
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: DB_SERVER
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt Database.Endpoint.Port
+            - Name: DB_NAME
+              Value: "appdb"
+            - Name: DB_DATABASE
+              Value: "appdb"
+            - Name: DB_USER
+              Value: "appuser"
+            - Name: DEBUG
+              Value: "0"
+            - Name: APP_BUCKET
+              Value: !Ref AppBucket
+            - !If
+              - HasEnvCacheUrl
+              - Name: CACHE_URL
+                Value: !Ref EnvCacheUrl
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvCeleryBrokerUrl
+              - Name: CELERY_BROKER_URL
+                Value: !Ref EnvCeleryBrokerUrl
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvEmailUrl
+              - Name: EMAIL_URL
+                Value: !Ref EnvEmailUrl
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvDefaultFromEmail
+              - Name: DEFAULT_FROM_EMAIL
+                Value: !Ref EnvDefaultFromEmail
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvAllowedClientHosts
+              - Name: ALLOWED_CLIENT_HOSTS
+                Value: !Ref EnvAllowedClientHosts
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvDashboardUrl
+              - Name: DASHBOARD_URL
+                Value: !Ref EnvDashboardUrl
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvAllowedHosts
+              - Name: ALLOWED_HOSTS
+                Value: !Ref EnvAllowedHosts
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvInternalIps
+              - Name: INTERNAL_IPS
+                Value: !Ref EnvInternalIps
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvSoftMemoryLimitInMb
+              - Name: SOFT_MEMORY_LIMIT_IN_MB
+                Value: !Ref EnvSoftMemoryLimitInMb
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvHardMemoryLimitInMb
+              - Name: HARD_MEMORY_LIMIT_IN_MB
+                Value: !Ref EnvHardMemoryLimitInMb
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvStaticUrl
+              - Name: STATIC_URL
+                Value: !Ref EnvStaticUrl
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvHttpIpFilterAllowLoopbackIps
+              - Name: HTTP_IP_FILTER_ALLOW_LOOPBACK_IPS
+                Value: !Ref EnvHttpIpFilterAllowLoopbackIps
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvAwsStorageBucketName
+              - Name: AWS_STORAGE_BUCKET_NAME
+                Value: !Ref EnvAwsStorageBucketName
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvGsBucketName
+              - Name: GS_BUCKET_NAME
+                Value: !Ref EnvGsBucketName
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvGoogleCloudProject
+              - Name: GOOGLE_CLOUD_PROJECT
+                Value: !Ref EnvGoogleCloudProject
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasEnvOpentelemetryEndpoint
+              - Name: OPENTELEMETRY_ENDPOINT
+                Value: !Ref EnvOpentelemetryEndpoint
+              - !Ref "AWS::NoValue"
+          Secrets:
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub "${DbSecret}:password::"
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub "${DbSecret}:password::"
+            - Name: DATABASE_URL
+              ValueFrom: !Ref DbUrlSecret
+            - Name: SECRET_KEY
+              ValueFrom: !Ref SecretSecretKey
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TargetGroup
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "DB credentials for ${AWS::StackName}"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"appuser"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+
+  DbUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    DependsOn: Database
+    Properties:
+      Description: !Sub "${AWS::StackName} — full connection URL, for apps that read one variable"
+      SecretString: !Sub
+        - "postgresql://appuser:${Password}@${Endpoint}:${Port}/appdb"
+        - Password: "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+          Endpoint: !GetAtt Database.Endpoint.Address
+          Port: !GetAtt Database.Endpoint.Port
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "Subnets for ${AWS::StackName} database"
+      SubnetIds: !Ref PublicSubnetIds
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database accepts traffic only from the app tasks.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: "20"
+      DBName: appdb
+      MasterUsername: appuser
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      # ── Transport security is INHERITED from the engine's default parameter group ──
+      #
+      # No DBParameterGroupName is set, so this instance takes the engine default — and that
+      # default differs by engine. Measured on this same template an hour apart: MySQL 8.4.9
+      # accepted a plain connection; default.mariadb11.8 ships require_secure_transport=1 and
+      # refused one ("Connections using insecure transport are prohibited"). Both stacks reached
+      # CREATE_COMPLETE with every target healthy — only the application could tell them apart.
+      #
+      # Pinning it here would mean pinning EngineVersion too (a parameter group needs a Family such
+      # as mariadb11.8), which trades this surprise for a version table that goes stale. So the
+      # posture is left to AWS and STATED instead — see the database section of the pull request.
+      # If your app connects in the clear and the engine requires TLS, give it the RDS CA bundle
+      # rather than turning the requirement off.
+      PubliclyAccessible: false
+      MultiAZ: false
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: !Ref EnableDeletionProtection
+
+  AppBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - Id: alb
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: all
+
+Outputs:
+  AppUrl:
+    Description: App URL (ALB DNS). Add a custom domain via the Website path for HTTPS.
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  CdnUrl:
+    Description: HTTPS URL served by CloudFront (edge TLS, no custom domain needed).
+    Value: !Sub "https://${Distribution.DomainName}"
+  DatabaseEndpoint:
+    Description: RDS endpoint the app connects to.
+    Value: !GetAtt Database.Endpoint.Address
