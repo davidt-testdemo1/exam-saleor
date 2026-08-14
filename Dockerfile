@@ -12,9 +12,11 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:0.12.1@sha256:cf4eedcaa81655197f625739489effcbe71b61ceb1506f332c3facae5deceded \
   /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_SYSTEM_PYTHON=1 UV_PROJECT_ENVIRONMENT=/usr/local
+# COPY rather than bind-mount so uv can write back the updated uv.lock when
+# --upgrade-package resolves a newer version (bind mounts are read-only from
+# the container side, causing "Read-only file system" errors on lockfile writes).
+COPY uv.lock pyproject.toml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --no-install-project --no-editable --upgrade-package cryptography
 
 ### Final image
