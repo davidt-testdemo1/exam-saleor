@@ -71,7 +71,7 @@ jobs:
           STAGE_TAG=""
           [ -n "$EFFECTIVE_STAGE" ] && STAGE_TAG="tudovu:stage=$EFFECTIVE_STAGE"
           echo "APP_STACK=$APP_STACK" >> "$GITHUB_ENV"
-          aws cloudformation deploy --template-file infra/app.yaml --stack-name "$APP_STACK" --capabilities CAPABILITY_IAM --region us-east-1 --tags "tudovu:repo=$REPO_FULL" purpose=plumber-saleor-e2e $STAGE_TAG --parameter-overrides ImageUri="$IMAGE" VpcId="$VPC_ID" PublicSubnetIds="$SUBNET_IDS"
+          aws cloudformation deploy --template-file infra/app.yaml --stack-name "$APP_STACK" --capabilities CAPABILITY_IAM --region us-east-1 --tags "tudovu:repo=$REPO_FULL" $STAGE_TAG --parameter-overrides ImageUri="$IMAGE" VpcId="$VPC_ID" PublicSubnetIds="$SUBNET_IDS"
       - name: Why the deploy failed
         if: failure()
         run: |
@@ -99,6 +99,45 @@ jobs:
               aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$t" --region us-east-1 \
                 --query "tasks[0].[stoppedReason,containers[0].reason]" --output text 2>/dev/null || true
             done
+          fi
+
+      # ── Database migrations ──
+      #
+      # Detected from the repository: manage.py is present (Django).
+      # Runs inside the VPC because the database is not reachable from anywhere else.
+      - name: Apply database migrations
+        env:
+          APP_STACK: ${{ env.APP_STACK }}
+        run: |
+          set -euo pipefail
+          STACK="${APP_STACK:-}"
+          [ -z "$STACK" ] && { echo "no stack resolved; skipping migrations"; exit 0; }
+          CLUSTER=$(aws cloudformation describe-stack-resources --stack-name "$STACK" --region us-east-1 \
+            --logical-resource-id Cluster --query "StackResources[0].PhysicalResourceId" --output text)
+          TASKDEF=$(aws cloudformation describe-stack-resources --stack-name "$STACK" --region us-east-1 \
+            --logical-resource-id TaskDefinition --query "StackResources[0].PhysicalResourceId" --output text)
+          SG=$(aws cloudformation describe-stack-resources --stack-name "$STACK" --region us-east-1 \
+            --logical-resource-id ServiceSecurityGroup --query "StackResources[0].PhysicalResourceId" --output text)
+          SUBNETS=$(aws cloudformation describe-stacks --stack-name "$STACK" --region us-east-1 \
+            --query "Stacks[0].Parameters[?ParameterKey=='PublicSubnetIds'].ParameterValue" --output text)
+          echo "migrating with: ["python","manage.py","migrate","--noinput"]"
+          ARN=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$TASKDEF" --launch-type FARGATE \
+            --region us-east-1 \
+            --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS//,/\,}],securityGroups=[$SG],assignPublicIp=ENABLED}" \
+            --overrides '{"containerOverrides":[{"name":"app","command":["python","manage.py","migrate","--noinput"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+          [ -z "$ARN" ] || [ "$ARN" = "None" ] && { echo "::error::Could not start the migration task."; exit 1; }
+          echo "migration task: $ARN"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$ARN" --region us-east-1
+          CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$ARN" --region us-east-1 \
+            --query "tasks[0].containers[0].exitCode" --output text)
+          REASON=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$ARN" --region us-east-1 \
+            --query "tasks[0].stoppedReason" --output text)
+          echo "migration exit code: $CODE ($REASON)"
+          if [ "$CODE" != "0" ]; then
+            echo "::error::Migrations failed (exit $CODE). The stack is up and the schema is not — the app will not work."
+            echo "Container logs are in the stack's log group."
+            exit 1
           fi
 
       # ── Did the deployment actually work? ──
