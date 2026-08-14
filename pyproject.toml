@@ -19,7 +19,7 @@ dependencies = [
     "babel>=2.18.0,<2.19",
     "boto3~=1.43",
     "botocore~=1.43",
-    "cryptography>=49.0.0",
+    "cryptography>=50.0.0",
     "dj-database-url>=3.1.2,<4",
     "dj-email-url>=1,<2",
     "django[bcrypt]~=5.2.17",
@@ -151,6 +151,9 @@ exclude-newer = "3 weeks"
 # Note: if you remove a package from this list and 'uv lock' does not update the
 #       lockfile, run 'uv lock --refresh' to force a refresh.
 django = "2026-08-04T15:05:00Z" # https://www.djangoproject.com/weblog/2026/aug/04/security-releases/
+# cryptography 50.0.0 fixes CVE-2026-69247 (HIGH). Pin the exclude-newer timestamp
+# to admit 50.0.0 ahead of the normal 3-week cooldown.
+cryptography = "2026-08-14T18:00:00Z" # https://github.com/pypa/cryptography/blob/main/CHANGELOG.rst
 
 [tool.pytest]
 addopts = [
